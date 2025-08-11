@@ -27,7 +27,24 @@ exports.handler = async (event) => {
     ];
 
     const select =
-      '$select=ListingKey,StreetNumber,StreetName,City,PostalCode,CityRegion,CountyOrParish,ArchitecturalStyle,ListPrice,ListPriceUnit,LotDepth,LotWidth,LotSizeRangeAcres,StandardStatus,PublicRemarks,TaxAnnualAmount,TaxAssessedValue,Tax_Year,TransactionType,Waterfront,BathroomsTotalInteger,BedroomsTotal,BuildingAreaTotal,LivingAreaRange,VirtualTourUnbranded,Latitude,Longitude,ModificationTimestamp';
+  '$select=' +
+  [
+    'ListingKey',
+    'StreetNumber','StreetName','City','PostalCode','CityRegion','CountyOrParish',
+    'ArchitecturalStyle',
+    'ListPrice',
+    'LotDepth','LotWidth','LotSizeRangeAcres',
+    'StandardStatus','PublicRemarks',
+    'TaxAnnualAmount','TaxAssessedValue',
+    // 'TaxYear',           // uncomment if confirmed in $metadata
+    // 'TransactionType',   // uncomment if confirmed in $metadata
+    'Waterfront',
+    'BathroomsTotalInteger','BedroomsTotal',
+    'BuildingAreaTotal',
+    // 'LivingAreaRange',   // uncomment if confirmed in $metadata
+    'VirtualTourUnbranded',
+    'Latitude','Longitude','ModificationTimestamp'
+  ].join(',');
 
     const propertyUrl =
       `${BASE}/Property?${select}&$filter=${encodeURIComponent(filters.join(' and '))}` +
