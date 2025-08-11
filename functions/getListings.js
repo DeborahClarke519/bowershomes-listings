@@ -36,13 +36,9 @@ exports.handler = async (event) => {
     'LotDepth','LotWidth','LotSizeRangeAcres',
     'StandardStatus','PublicRemarks',
     'TaxAnnualAmount','TaxAssessedValue',
-    // 'TaxYear',           // uncomment if confirmed in $metadata
-    // 'TransactionType',   // uncomment if confirmed in $metadata
     'Waterfront',
     'BathroomsTotalInteger','BedroomsTotal',
     'BuildingAreaTotal',
-    // 'LivingAreaRange',   // uncomment if confirmed in $metadata
-    'VirtualTourUnbranded',
     'Latitude','Longitude','ModificationTimestamp'
   ].join(',');
 
