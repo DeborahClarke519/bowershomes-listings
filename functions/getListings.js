@@ -73,30 +73,45 @@ exports.handler = async (event) => {
       return { statusCode: 200, headers: cors, body: JSON.stringify({ value: [], paging: { startidx, pgsize } }) };
     }
 
-    // 2) fetch preferred largest photos; map by ResourceRecordKey (== ListingKey)
-    const mediaUrl = `${BASE}/Media?$filter=${encodeURIComponent(
-      "PreferredPhotoYN eq true and ImageSizeDescription eq 'Largest'"
-    )}&$top=2000`;
-    const mediaRes = await fetch(mediaUrl, { headers: headersAuth });
+  // 2) fetch preferred THUMBNAIL photos for speed; map by ResourceRecordKey (== ListingKey)
+const thumbsUrl = `${BASE}/Media?$filter=${encodeURIComponent(
+  "PreferredPhotoYN eq true and ImageSizeDescription eq 'Thumbnail'"
+)}&$top=2000`;
+const thumbsRes = await fetch(thumbsUrl, { headers: headersAuth });
 
-    const mediaMap = {};
-    if (mediaRes.ok) {
-      const mediaJson = await mediaRes.json().catch(() => ({}));
-      const mediaArr = Array.isArray(mediaJson.value) ? mediaJson.value : [];
-      const want = new Set(listings.map(l => l.ListingKey).filter(Boolean));
-      for (const m of mediaArr) {
-        if (!m || !m.ResourceRecordKey || !m.MediaURL) continue;
-        if (want.has(m.ResourceRecordKey) && !mediaMap[m.ResourceRecordKey]) {
-          mediaMap[m.ResourceRecordKey] = m.MediaURL;
-        }
-      }
+const thumbMap = {};
+if (thumbsRes.ok) {
+  const mediaJson = await thumbsRes.json().catch(() => ({}));
+  const mediaArr = Array.isArray(mediaJson.value) ? mediaJson.value : [];
+  const want = new Set(listings.map(l => l.ListingKey).filter(Boolean));
+  for (const m of mediaArr) {
+    if (!m || !m.ResourceRecordKey || !m.MediaURL) continue;
+    if (want.has(m.ResourceRecordKey) && !thumbMap[m.ResourceRecordKey]) {
+      thumbMap[m.ResourceRecordKey] = m.MediaURL;
     }
-
-    const enriched = listings.map(l => ({ ...l, PhotoURL: mediaMap[l.ListingKey] || null }));
-
-    return { statusCode: 200, headers: cors, body: JSON.stringify({ value: enriched, paging: { startidx, pgsize } }) };
-  } catch (err) {
-    return { statusCode: 500, headers: cors, body: JSON.stringify({ error: 'Server error', detail: err.message }) };
   }
-};
+}
 
+// Optional: fallback to LARGEST only if no thumb was found
+const largestUrl = `${BASE}/Media?$filter=${encodeURIComponent(
+  "PreferredPhotoYN eq true and ImageSizeDescription eq 'Largest'"
+)}&$top=2000`;
+const largestRes = await fetch(largestUrl, { headers: headersAuth });
+
+const largeMap = {};
+if (largestRes.ok) {
+  const mediaJson = await largestRes.json().catch(() => ({}));
+  const mediaArr = Array.isArray(mediaJson.value) ? mediaJson.value : [];
+  const want = new Set(listings.map(l => l.ListingKey).filter(Boolean));
+  for (const m of mediaArr) {
+    if (!m || !m.ResourceRecordKey || !m.MediaURL) continue;
+    if (want.has(m.ResourceRecordKey) && !largeMap[m.ResourceRecordKey]) {
+      largeMap[m.ResourceRecordKey] = m.MediaURL;
+    }
+  }
+}
+
+const enriched = listings.map(l => ({
+  ...l,
+  PhotoURL: thumbMap[l.ListingKey] || largeMap[l.ListingKey] || null
+}));
