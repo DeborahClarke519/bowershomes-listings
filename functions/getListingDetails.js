@@ -51,27 +51,53 @@ exports.handler = async (event) => {
       return { statusCode: 404, headers: cors, body: JSON.stringify({ error: 'Listing not found' }) };
     }
 
-    // All media for this listing, ordered if available
-    const mediaUrl = `${BASE}/Media?$filter=${encodeURIComponent(`ResourceRecordKey eq ${s(id)}`)}&$top=200`;
-    const mediaRes = await fetch(mediaUrl, { headers: headersAuth });
+   // All media for this listing, then de-dupe by MediaObjectID (or MediaKey base)
+const mediaUrl = `${BASE}/Media?$filter=${encodeURIComponent(`ResourceRecordKey eq ${s(id)}`)}&$top=200`;
+const mediaRes = await fetch(mediaUrl, { headers: headersAuth });
 
-    let photos = [];
-    if (mediaRes.ok) {
-      const mediaJson = await mediaRes.json().catch(() => ({}));
-      const arr = Array.isArray(mediaJson.value) ? mediaJson.value : [];
-      photos = arr
-        .filter(m => m && m.MediaURL && (m.MediaType || '').startsWith('image/'))
-        .sort((a, b) => {
-          // prefer PreferredPhotoYN first, then by Order (if present)
-          const aPref = a.PreferredPhotoYN ? -1 : 0;
-          const bPref = b.PreferredPhotoYN ? -1 : 0;
-          if (aPref !== bPref) return aPref - bPref;
-          const ao = Number.isFinite(a.Order) ? a.Order : 9999;
-          const bo = Number.isFinite(b.Order) ? b.Order : 9999;
-          return ao - bo;
-        })
-        .map(m => m.MediaURL);
+let photos = [];
+if (mediaRes.ok) {
+  const mediaJson = await mediaRes.json().catch(() => ({}));
+  const arr = Array.isArray(mediaJson.value) ? mediaJson.value : [];
+
+  // Normalize key to de-duplicate thumbnail/largest pairs of same photo
+  const seen = new Map(); // key -> {url, order, preferred}
+  for (const m of arr) {
+    if (!m || !m.MediaURL || !(m.MediaType || '').startsWith('image/')) continue;
+    const baseKey =
+      m.MediaObjectID ||
+      (typeof m.MediaKey === 'string' ? m.MediaKey.replace(/-t$/i, '') : null) ||
+      m.MediaURL;
+
+    const rec = seen.get(baseKey);
+    const candidate = {
+      url: m.MediaURL,
+      order: Number.isFinite(m.Order) ? m.Order : 9999,
+      preferred: !!m.PreferredPhotoYN,
+      size: String(m.ImageSizeDescription || '')
+    };
+
+    if (!rec) {
+      seen.set(baseKey, candidate);
+    } else {
+      // Keep the better of the two: prefer Largest > Medium > Thumbnail, then preferred flag
+      const rank = s => ({ largest:3, medium:2, thumbnail:1 }[String(s).toLowerCase()] || 0);
+      const better =
+        rank(candidate.size) > rank(rec.size) ||
+        (rank(candidate.size) === rank(rec.size) && candidate.preferred && !rec.preferred);
+      if (better) seen.set(baseKey, candidate);
     }
+  }
+
+  const unique = Array.from(seen.values());
+  unique.sort((a,b) => {
+    if (a.preferred !== b.preferred) return a.preferred ? -1 : 1;
+    return a.order - b.order;
+  });
+
+  photos = unique.map(x => x.url);
+}
+
 
     return { statusCode: 200, headers: cors, body: JSON.stringify({ listing, photos }) };
   } catch (err) {
