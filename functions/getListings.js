@@ -3,18 +3,25 @@ const fetch = require('node-fetch');
 
 const ACCESS_TOKEN = process.env.PROPTX_ACCESS_TOKEN;
 const BASE = 'https://query.ampre.ca/odata';
-const headersAuth = { Authorization: `Bearer ${ACCESS_TOKEN}`, Accept: 'application/json' };
-const cors = {
+
+const AUTH_HEADERS = {
+  Authorization: `Bearer ${ACCESS_TOKEN}`,
+  Accept: 'application/json'
+};
+
+const CORS = {
   'Access-Control-Allow-Origin': '*',
   'Content-Type': 'application/json',
   'Cache-Control': 'no-store'
 };
-const s = v => `'${String(v).replace(/'/g, "''")}'`; // OData-safe quotes
+
+// OData-safe single-quoted string
+const q = v => `'${String(v).replace(/'/g, "''")}'`;
 
 exports.handler = async (event) => {
   try {
     if (!ACCESS_TOKEN) {
-      return { statusCode: 500, headers: cors, body: JSON.stringify({ error: 'Missing PROPTX_ACCESS_TOKEN' }) };
+      return { statusCode: 500, headers: CORS, body: JSON.stringify({ error: 'Missing PROPTX_ACCESS_TOKEN' }) };
     }
 
     const qp = event.queryStringParameters || {};
@@ -29,18 +36,19 @@ exports.handler = async (event) => {
     const sortBy   = qp.sort_by || 'date_desc';
 
     const filters = [];
-    if (city)   filters.push(`City eq ${s(city)}`);
-    if (status) filters.push(`StandardStatus eq ${s(status)}`);
-    if (minPrice !== null) filters.push(`ListPrice ge ${minPrice}`);
-    if (maxPrice !== null) filters.push(`ListPrice le ${maxPrice}`);
-    if (beds !== null)     filters.push(`BedroomsTotal ge ${beds}`);
-    if (baths !== null)    filters.push(`BathroomsTotalInteger ge ${baths}`);
+    if (city)          filters.push(`City eq ${q(city)}`);
+    if (status)        filters.push(`StandardStatus eq ${q(status)}`);
+    if (minPrice!=null)filters.push(`ListPrice ge ${minPrice}`);
+    if (maxPrice!=null)filters.push(`ListPrice le ${maxPrice}`);
+    if (beds!=null)    filters.push(`BedroomsTotal ge ${beds}`);
+    if (baths!=null)   filters.push(`BathroomsTotalInteger ge ${baths}`);
 
     let orderby = 'ModificationTimestamp desc';
     if (sortBy === 'price_asc')  orderby = 'ListPrice asc';
     if (sortBy === 'price_desc') orderby = 'ListPrice desc';
     if (sortBy === 'date_asc')   orderby = 'ModificationTimestamp asc';
 
+    // Conservative field list (we pruned fields that previously 1109'd)
     const select =
       '$select=' + [
         'ListingKey',
@@ -56,71 +64,50 @@ exports.handler = async (event) => {
         'Latitude','Longitude','ModificationTimestamp'
       ].join(',');
 
-    const propUrl = `${BASE}/Property?${select}${
-      filters.length ? `&$filter=${encodeURIComponent(filters.join(' and '))}` : ''
-    }&$orderby=${encodeURIComponent(orderby)}&$top=${pgsize}&$skip=${startidx}`;
+    const propUrl = `${BASE}/Property?${select}`
+      + (filters.length ? `&$filter=${encodeURIComponent(filters.join(' and '))}` : '')
+      + `&$orderby=${encodeURIComponent(orderby)}&$top=${pgsize}&$skip=${startidx}`;
 
-    // 1) fetch properties
-    const propRes = await fetch(propUrl, { headers: headersAuth });
+    // 1) Fetch properties
+    const propRes = await fetch(propUrl, { headers: AUTH_HEADERS });
     if (!propRes.ok) {
       const t = await propRes.text();
-      return { statusCode: propRes.status, headers: cors, body: JSON.stringify({ error: 'Property fetch failed', detail: t }) };
+      return { statusCode: propRes.status, headers: CORS, body: JSON.stringify({ error: 'Property fetch failed', detail: t }) };
     }
     const propJson = await propRes.json();
     const listings = Array.isArray(propJson.value) ? propJson.value : [];
     if (!listings.length) {
-      return { statusCode: 200, headers: cors, body: JSON.stringify({ value: [], paging: { startidx, pgsize } }) };
+      return { statusCode: 200, headers: CORS, body: JSON.stringify({ value: [], paging: { startidx, pgsize } }) };
     }
 
-    // 2) preferred THUMBNAIL for speed
-    const thumbsUrl = `${BASE}/Media?$filter=${encodeURIComponent(
-      "PreferredPhotoYN eq true and ImageSizeDescription eq 'Thumbnail'"
-    )}&$top=2000`;
-    const thumbsRes = await fetch(thumbsUrl, { headers: headersAuth });
+    // 2) Fetch "preferred photo" media (no size filter), then map by ListingKey
+    const prefUrl = `${BASE}/Media?$filter=${encodeURIComponent("PreferredPhotoYN eq true")}&$top=4000`;
+    const prefRes = await fetch(prefUrl, { headers: AUTH_HEADERS });
 
-    const thumbMap = {};
-    if (thumbsRes.ok) {
-      const mediaJson = await thumbsRes.json().catch(() => ({}));
+    const photoMap = {}; // ListingKey -> { url, key }
+    if (prefRes.ok) {
+      const mediaJson = await prefRes.json().catch(() => ({}));
       const mediaArr = Array.isArray(mediaJson.value) ? mediaJson.value : [];
-      const want = new Set(listings.map(l => l.ListingKey).filter(Boolean));
+      const wanted = new Set(listings.map(l => l.ListingKey).filter(Boolean));
       for (const m of mediaArr) {
-        if (!m || !m.ResourceRecordKey || !m.MediaURL) continue;
-        if (want.has(m.ResourceRecordKey) && !thumbMap[m.ResourceRecordKey]) {
-          thumbMap[m.ResourceRecordKey] = m.MediaURL;
-        }
-      }
-    }
-
-    // 3) fallback to LARGEST if no thumb
-    const largestUrl = `${BASE}/Media?$filter=${encodeURIComponent(
-      "PreferredPhotoYN eq true and ImageSizeDescription eq 'Largest'"
-    )}&$top=2000`;
-    const largestRes = await fetch(largestUrl, { headers: headersAuth });
-
-    const largeMap = {};
-    if (largestRes.ok) {
-      const mediaJson = await largestRes.json().catch(() => ({}));
-      const mediaArr = Array.isArray(mediaJson.value) ? mediaJson.value : [];
-      const want = new Set(listings.map(l => l.ListingKey).filter(Boolean));
-      for (const m of mediaArr) {
-        if (!m || !m.ResourceRecordKey || !m.MediaURL) continue;
-        if (want.has(m.ResourceRecordKey) && !largeMap[m.ResourceRecordKey]) {
-          largeMap[m.ResourceRecordKey] = m.MediaURL;
+        if (!m || !m.ResourceRecordKey) continue;
+        if (!wanted.has(m.ResourceRecordKey)) continue;
+        // Keep first preferred record we see (usually primary)
+        if (!photoMap[m.ResourceRecordKey]) {
+          photoMap[m.ResourceRecordKey] = { url: m.MediaURL || null, key: m.MediaKey || null };
         }
       }
     }
 
     const enriched = listings.map(l => ({
       ...l,
-      PhotoURL: thumbMap[l.ListingKey] || largeMap[l.ListingKey] || null
+      PhotoURL: photoMap[l.ListingKey]?.url || null,
+      PhotoKey: photoMap[l.ListingKey]?.key || null
     }));
 
-    return {
-      statusCode: 200,
-      headers: cors,
-      body: JSON.stringify({ value: enriched, paging: { startidx, pgsize } })
-    };
+    return { statusCode: 200, headers: CORS, body: JSON.stringify({ value: enriched, paging: { startidx, pgsize } }) };
   } catch (err) {
-    return { statusCode: 500, headers: cors, body: JSON.stringify({ error: 'Server error', detail: err.message }) };
+    return { statusCode: 500, headers: CORS, body: JSON.stringify({ error: 'Server error', detail: err.message }) };
   }
 };
+
