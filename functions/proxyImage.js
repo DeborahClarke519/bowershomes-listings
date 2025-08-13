@@ -3,62 +3,81 @@ const fetch = require('node-fetch');
 
 const ACCESS_TOKEN = process.env.PROPTX_ACCESS_TOKEN;
 const BASE = 'https://query.ampre.ca/odata';
+
+// CORS + caching (tune as you like)
 const CORS = { 'Access-Control-Allow-Origin': '*' };
+const CACHE = { 'Cache-Control': 'public, max-age=600, stale-while-revalidate=86400' };
+
+function ok(bodyBuf, contentType) {
+  return {
+    statusCode: 200,
+    headers: { ...CORS, ...CACHE, 'Content-Type': contentType || 'image/jpeg' },
+    body: bodyBuf.toString('base64'),
+    isBase64Encoded: true
+  };
+}
+function err(status, message) {
+  return {
+    statusCode: status,
+    headers: { ...CORS, 'Content-Type': 'text/plain' },
+    body: message || String(status)
+  };
+}
 
 exports.handler = async (event) => {
   try {
     const qs = event.queryStringParameters || {};
-    const key = qs.key; // MediaKey (preferred)
-    const u   = qs.u;   // raw CDN URL (fallback)
+    const key = qs.key && String(qs.key).trim();      // PropTX MediaKey
+    const u   = qs.u && String(qs.u).trim();          // fallback absolute URL
 
-    if (!ACCESS_TOKEN) {
-      return { statusCode: 500, headers: CORS, body: 'Missing PROPTX_ACCESS_TOKEN' };
-    }
+    if (!ACCESS_TOKEN) return err(500, 'Missing PROPTX_ACCESS_TOKEN');
 
-    // Prefer fetching the binary directly from PropTX by MediaKey (authorized).
+    // Primary path: fetch binary directly from PropTX by MediaKey
     if (key) {
-      // OData binary stream for a single media record
-      const mediaUrl = `${BASE}/Media('${encodeURIComponent(key)}')/$value`;
-      const upstream = await fetch(mediaUrl, {
+      const url = `${BASE}/Media('${encodeURIComponent(key)}')/$value`;
+      const res = await fetch(url, {
         headers: {
           Authorization: `Bearer ${ACCESS_TOKEN}`,
+          // Pretend like a browser image request
           Accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8'
-        }
+        },
+        redirect: 'follow'
       });
-
-      if (!upstream.ok) {
-        const txt = await upstream.text().catch(()=> '');
-        return { statusCode: upstream.status, headers: { ...CORS, 'Content-Type': 'text/plain' }, body: txt || `Upstream error ${upstream.status}` };
+      if (!res.ok) {
+        const txt = await res.text().catch(() => '');
+        return err(res.status, txt || `PropTX media error ${res.status}`);
       }
-
-      const ct = upstream.headers.get('content-type') || 'image/jpeg';
-      const buf = Buffer.from(await upstream.arrayBuffer());
-      return { statusCode: 200, headers: { ...CORS, 'Content-Type': ct, 'Cache-Control': 'public, max-age=600' }, body: buf.toString('base64'), isBase64Encoded: true };
+      const ct = res.headers.get('content-type') || 'image/jpeg';
+      const buf = Buffer.from(await res.arrayBuffer());
+      return ok(buf, ct);
     }
 
-    // Fallback: proxy a raw URL (may be forbidden by CDN policies).
+    // Fallback path: proxy an absolute URL (some CDNs block hotlinking; this may 403)
     if (u) {
-      const upstream = await fetch(u, {
+      try {
+        new URL(u); // throws if not absolute
+      } catch {
+        return err(400, 'Only absolute URLs are supported');
+      }
+      const res = await fetch(u, {
         headers: {
           'User-Agent': 'Mozilla/5.0',
           Accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8'
         },
         redirect: 'follow'
       });
-
-      if (!upstream.ok) {
-        const txt = await upstream.text().catch(()=> '');
-        return { statusCode: upstream.status, headers: { ...CORS, 'Content-Type': 'text/plain' }, body: txt || `Upstream error ${upstream.status}` };
+      if (!res.ok) {
+        const txt = await res.text().catch(() => '');
+        return err(res.status, txt || `Upstream error ${res.status}`);
       }
-
-      const ct = upstream.headers.get('content-type') || 'image/jpeg';
-      const buf = Buffer.from(await upstream.arrayBuffer());
-      return { statusCode: 200, headers: { ...CORS, 'Content-Type': ct, 'Cache-Control': 'public, max-age=600' }, body: buf.toString('base64'), isBase64Encoded: true };
+      const ct = res.headers.get('content-type') || 'image/jpeg';
+      const buf = Buffer.from(await res.arrayBuffer());
+      return ok(buf, ct);
     }
 
-    return { statusCode: 400, headers: CORS, body: 'Missing "key" or "u" query param' };
+    return err(400, 'Missing "key" or "u" query param');
   } catch (e) {
-    return { statusCode: 500, headers: CORS, body: e.message || 'Proxy failure' };
+    return err(500, e.message || 'Proxy failure');
   }
 };
 
