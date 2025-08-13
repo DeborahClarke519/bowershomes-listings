@@ -18,6 +18,12 @@ const CORS = {
 // OData-safe single-quoted string
 const q = v => `'${String(v).replace(/'/g, "''")}'`;
 
+// Build an OData OR filter like: (ResourceRecordKey eq 'A' or ResourceRecordKey eq 'B')
+function orEq(field, values) {
+  const parts = values.map(v => `${field} eq ${q(v)}`);
+  return parts.length > 1 ? `(${parts.join(' or ')})` : parts[0];
+}
+
 exports.handler = async (event) => {
   try {
     if (!ACCESS_TOKEN) {
@@ -48,7 +54,7 @@ exports.handler = async (event) => {
     if (sortBy === 'price_desc') orderby = 'ListPrice desc';
     if (sortBy === 'date_asc')   orderby = 'ModificationTimestamp asc';
 
-    // Conservative field list (we pruned fields that previously 1109'd)
+    // Conservative, working field list
     const select =
       '$select=' + [
         'ListingKey',
@@ -80,23 +86,44 @@ exports.handler = async (event) => {
       return { statusCode: 200, headers: CORS, body: JSON.stringify({ value: [], paging: { startidx, pgsize } }) };
     }
 
-    // 2) Fetch "preferred photo" media (no size filter), then map by ListingKey
-    const prefUrl = `${BASE}/Media?$filter=${encodeURIComponent("PreferredPhotoYN eq true")}&$top=4000`;
-    const prefRes = await fetch(prefUrl, { headers: AUTH_HEADERS });
-
+    // 2) Build a key list for this page
+    const keys = listings.map(l => l.ListingKey).filter(Boolean);
     const photoMap = {}; // ListingKey -> { url, key }
-    if (prefRes.ok) {
-      const mediaJson = await prefRes.json().catch(() => ({}));
-      const mediaArr = Array.isArray(mediaJson.value) ? mediaJson.value : [];
-      const wanted = new Set(listings.map(l => l.ListingKey).filter(Boolean));
-      for (const m of mediaArr) {
-        if (!m || !m.ResourceRecordKey) continue;
-        if (!wanted.has(m.ResourceRecordKey)) continue;
-        // Keep first preferred record we see (usually primary)
-        if (!photoMap[m.ResourceRecordKey]) {
-          photoMap[m.ResourceRecordKey] = { url: m.MediaURL || null, key: m.MediaKey || null };
+
+    // Helper to fetch a batch of media with a given extra predicate
+    async function fetchMediaBatch(extraPredicate) {
+      // chunk keys (OData URLs can get long; keep batches reasonable)
+      const chunkSize = 40;
+      for (let i = 0; i < keys.length; i += chunkSize) {
+        const chunk = keys.slice(i, i + chunkSize);
+        const basePred = [
+          "ResourceName eq 'Property'",
+          "MediaCategory eq 'Photo'",
+          extraPredicate,                 // e.g., "PreferredPhotoYN eq true"
+          orEq('ResourceRecordKey', chunk)
+        ].filter(Boolean).join(' and ');
+        const url = `${BASE}/Media?$filter=${encodeURIComponent(basePred)}&$top=2000`;
+
+        const res = await fetch(url, { headers: AUTH_HEADERS });
+        if (!res.ok) continue;
+        const json = await res.json().catch(() => ({}));
+        const arr = Array.isArray(json.value) ? json.value : [];
+        for (const m of arr) {
+          // Keep the first one we see per listing (primary/first)
+          const k = m && m.ResourceRecordKey;
+          if (!k || photoMap[k]) continue;
+          photoMap[k] = { url: m.MediaURL || null, key: m.MediaKey || null };
         }
       }
+    }
+
+    // First pass: strictly preferred photo
+    await fetchMediaBatch("PreferredPhotoYN eq true");
+
+    // Fallback pass: any photo if preferred isn't present
+    const missing = keys.filter(k => !photoMap[k]);
+    if (missing.length) {
+      await fetchMediaBatch(null);
     }
 
     const enriched = listings.map(l => ({
