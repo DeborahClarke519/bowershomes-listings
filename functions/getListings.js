@@ -122,9 +122,12 @@ exports.handler = async (event) => {
     // If "open houses", try strategies to get the relevant ListingKeys
     let restrictKeys = null;
     if (openhouse) {
+      const collected = new Set();
+
+      // --- Weekend window (Sat 00:00 to Sun 23:59:59) ---
       const { startISO, endISO } = weekendWindowISO();
 
-      // Strategy 1: OpenHouse resource
+      // ---------- Strategy A: OpenHouse resource ----------
       const ohPreds = [
         `StartTimestamp ge ${q(startISO)} and EndTimestamp le ${q(endISO)}`,
         `OpenHouseStartTimestamp ge ${q(startISO)} and OpenHouseEndTimestamp le ${q(endISO)}`,
@@ -138,108 +141,65 @@ exports.handler = async (event) => {
           if (!r.ok) continue;
           const j = await safeJson(r);
           const keys = Array.isArray(j.value) ? j.value.map(x => x && x.ResourceRecordKey).filter(Boolean) : [];
-          if (keys.length) { restrictKeys = Array.from(new Set(keys)); break; }
-        } catch { /* try next */ }
+          keys.forEach(k => collected.add(k));
+          if (keys.length) break; // first predicate that yields results is fine
+        } catch { /* move on */ }
       }
 
-      // Strategy 2: property-level flags (try independently; first that works wins)
-      if (!restrictKeys) {
-        // 2a) OpenHouseCount gt 0
-        try {
-          const u = `${BASE}/Property?$select=ListingKey&$filter=${encodeURIComponent('OpenHouseCount gt 0')}&$top=5000`;
-          const r = await fetch(u, { headers: AUTH_HEADERS });
-          if (r.ok) {
-            const j = await safeJson(r);
-            const keys = Array.isArray(j.value) ? j.value.map(x => x && x.ListingKey).filter(Boolean) : [];
-            if (keys.length) restrictKeys = Array.from(new Set(keys));
-          }
-        } catch { /* ignore */ }
-      }
-      if (!restrictKeys) {
-        // 2b) OpenHouseActiveYN eq true
-        try {
-          const u = `${BASE}/Property?$select=ListingKey&$filter=${encodeURIComponent('OpenHouseActiveYN eq true')}&$top=5000`;
-          const r = await fetch(u, { headers: AUTH_HEADERS });
-          if (r.ok) {
-            const j = await safeJson(r);
-            const keys = Array.isArray(j.value) ? j.value.map(x => x && x.ListingKey).filter(Boolean) : [];
-            if (keys.length) restrictKeys = Array.from(new Set(keys));
-          }
-        } catch { /* ignore */ }
-      }
-
-      // If we still have no keys, return empty (there may simply be no OH this weekend)
-      if (!restrictKeys || !restrictKeys.length) {
-        return { statusCode: 200, headers: CORS, body: JSON.stringify({ value: [], paging: { startidx, pgsize, openhouse:true } }) };
-      }
-    }
-
-    // 1) Properties (optionally intersect with open-house keys)
-    let propUrl = `${BASE}/Property?${select}`;
-    const propFilters = filters.slice();
-    if (restrictKeys && restrictKeys.length) {
-      const chunkSize = 40;
-      const orGroups = [];
-      for (let i = 0; i < restrictKeys.length; i += chunkSize) {
-        const chunk = restrictKeys.slice(i, i + chunkSize);
-        orGroups.push(orEq('ListingKey', chunk));
-      }
-      const keysPredicate = orGroups.length > 1 ? `(${orGroups.join(' or ')})` : orGroups[0];
-      propFilters.push(keysPredicate);
-    }
-    if (propFilters.length) propUrl += `&$filter=${encodeURIComponent(propFilters.join(' and '))}`;
-    propUrl += `&$orderby=${encodeURIComponent(orderby)}&$top=${pgsize}&$skip=${startidx}`;
-
-    const propRes = await fetch(propUrl, { headers: AUTH_HEADERS });
-    if (!propRes.ok) {
-      const t = await propRes.text();
-      return { statusCode: propRes.status, headers: CORS, body: JSON.stringify({ error: 'Property fetch failed', detail: t }) };
-    }
-    const propJson = await propRes.json();
-    const listings = Array.isArray(propJson.value) ? propJson.value : [];
-    if (!listings.length) {
-      return { statusCode: 200, headers: CORS, body: JSON.stringify({ value: [], paging: { startidx, pgsize, openhouse: !!openhouse } }) };
-    }
-
-    // 2) Photos (preferred first; fallback to any)
-    const keys = listings.map(l => l.ListingKey).filter(Boolean);
-    const photoMap = {}; // ListingKey -> { url, key }
-
-    async function fetchMediaBatch(listingKeys, extraPredicate) {
-      const chunkSize = 40;
-      for (let i = 0; i < listingKeys.length; i += chunkSize) {
-        const chunk = listingKeys.slice(i, i + chunkSize);
-        const basePred = [
-          "ResourceName eq 'Property'",
-          "MediaCategory eq 'Photo'",
-          extraPredicate,
-          orEq('ResourceRecordKey', chunk)
-        ].filter(Boolean).join(' and ');
-        const url = `${BASE}/Media?$filter=${encodeURIComponent(basePred)}&$top=2000`;
-        const res = await fetch(url, { headers: AUTH_HEADERS });
-        if (!res.ok) continue;
-        const json = await safeJson(res);
-        const arr = Array.isArray(json.value) ? json.value : [];
-        for (const m of arr) {
-          const k = m && m.ResourceRecordKey;
-          if (!k || photoMap[k]) continue;
-          photoMap[k] = { url: m.MediaURL || null, key: m.MediaKey || null };
+      // ---------- Strategy B: Property-level OH flags ----------
+      // 1) OpenHouseCount gt 0
+      try {
+        const u = `${BASE}/Property?$select=ListingKey&$filter=${encodeURIComponent('OpenHouseCount gt 0')}&$top=5000`;
+        const r = await fetch(u, { headers: AUTH_HEADERS });
+        if (r.ok) {
+          const j = await safeJson(r);
+          const keys = Array.isArray(j.value) ? j.value.map(x => x && x.ListingKey).filter(Boolean) : [];
+          keys.forEach(k => collected.add(k));
         }
+      } catch {}
+
+      // 2) OpenHouseActiveYN eq true
+      try {
+        const u = `${BASE}/Property?$select=ListingKey&$filter=${encodeURIComponent('OpenHouseActiveYN eq true')}&$top=5000`;
+        const r = await fetch(u, { headers: AUTH_HEADERS });
+        if (r.ok) {
+          const j = await safeJson(r);
+          const keys = Array.isArray(j.value) ? j.value.map(x => x && x.ListingKey).filter(Boolean) : [];
+          keys.forEach(k => collected.add(k));
+        }
+      } catch {}
+
+      // ---------- Strategy C: Virtual Tours via Media ----------
+      // We treat MediaCategory 'VirtualTour' or 'Video' or URLs/descriptions that clearly point
+      // to hosted tours (YouTube/Vimeo/Matterport) as "virtual open house".
+      const vtPredicates = [
+        "(MediaCategory eq 'VirtualTour')",
+        "(MediaCategory eq 'Video')",
+        "contains(tolower(MediaURL),'youtube')",
+        "contains(tolower(MediaURL),'vimeo')",
+        "contains(tolower(MediaURL),'matterport')",
+        "contains(tolower(ShortDescription),'virtual')"
+      ];
+      // Chunked in case of large results; filtered to Property photos
+      const vtFilter = [
+        "ResourceName eq 'Property'",
+        `(${vtPredicates.join(' or ')})`
+      ].join(' and ');
+      try {
+        const u = `${BASE}/Media?$select=ResourceRecordKey&$filter=${encodeURIComponent(vtFilter)}&$top=5000`;
+        const r = await fetch(u, { headers: AUTH_HEADERS });
+        if (r.ok) {
+          const j = await safeJson(r);
+          const keys = Array.isArray(j.value) ? j.value.map(x => x && x.ResourceRecordKey).filter(Boolean) : [];
+          keys.forEach(k => collected.add(k));
+        }
+      } catch {}
+
+      restrictKeys = Array.from(collected);
+
+      // If nothing matched (no scheduled OH and no virtual tours),
+      // return an empty result set early.
+      if (!restrictKeys || !restrictKeys.length) {
+        return { statusCode: 200, headers: CORS, body: JSON.stringify({ value: [], paging: { startidx, pgsize, openhouse: true } }) };
       }
     }
-
-    await fetchMediaBatch(keys, "PreferredPhotoYN eq true");
-    const missing = keys.filter(k => !photoMap[k]);
-    if (missing.length) await fetchMediaBatch(missing, null);
-
-    const enriched = listings.map(l => ({
-      ...l,
-      PhotoURL: photoMap[l.ListingKey]?.url || null,
-      PhotoKey: photoMap[l.ListingKey]?.key || null
-    }));
-
-    return { statusCode: 200, headers: CORS, body: JSON.stringify({ value: enriched, paging: { startidx, pgsize, openhouse: !!openhouse } }) };
-  } catch (err) {
-    return { statusCode: 500, headers: CORS, body: JSON.stringify({ error: 'Server error', detail: err.message }) };
-  }
-};
