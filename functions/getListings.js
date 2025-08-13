@@ -7,23 +7,20 @@ const BASE = process.env.PROPTX_BASE || 'https://query.ampre.ca/odata';
 const AUTH_HEADERS = { Authorization: `Bearer ${ACCESS_TOKEN}`, Accept: 'application/json' };
 const CORS = { 'Access-Control-Allow-Origin': '*', 'Content-Type': 'application/json', 'Cache-Control': 'no-store' };
 
+// OData helpers
 const q = v => `'${String(v).replace(/'/g, "''")}'`;
 const orEq = (field, values) => {
   const parts = values.map(v => `${field} eq ${q(v)}`);
   return parts.length > 1 ? `(${parts.join(' or ')})` : parts[0];
 };
 
-// Normalizes place names and provides municipality/region hints
+// Normalize community/place into municipality & region candidates
 function resolvePlace(raw) {
   if (!raw) return null;
   const name = String(raw).trim();
 
-  // Canonicalize common variants
-  const canon = name.toLowerCase()
-    .replace(/\s+/g, ' ')
-    .replace(/\bclarke\b/g, 'clark'); // Point Clarke -> Point Clark
+  const canon = name.toLowerCase().replace(/\s+/g, ' ').replace(/\bclarke\b/g, 'clark');
 
-  // Map places to likely municipality + region labels
   const map = {
     'kincardine':                 { cities: ['Kincardine'], regions: [] },
     'lorne beach':                { cities: ['Huron-Kinloss','Kincardine'], regions: ['Lorne Beach'] },
@@ -40,14 +37,14 @@ function resolvePlace(raw) {
     'paisley':                    { cities: ['Arran-Elderslie'], regions: ['Paisley'] },
     'arran-elderslie':            { cities: ['Arran-Elderslie'], regions: [] },
     'lucknow':                    { cities: ['Huron-Kinloss','Ashfield-Colborne-Wawanosh'], regions: ['Lucknow'] },
-    // keep a few helpful extras
+    // helpful extras
     'goderich':                   { cities: ['Goderich'], regions: [] },
     'bayfield':                   { cities: ['Bluewater'], regions: ['Bayfield'] },
   };
   return map[canon] || { cities: [name], regions: [name] };
 }
 
-// Next Sat 00:00 to Sun 23:59:59 (Toronto locale → ISO UTC as approximation)
+// Next Sat 00:00 to Sun 23:59:59 (approx, UTC ISO)
 function weekendWindowISO() {
   const now = new Date();
   const day = now.getDay(); // 0 Sun .. 6 Sat
@@ -57,16 +54,16 @@ function weekendWindowISO() {
   return { startISO: sat.toISOString(), endISO: sun.toISOString() };
 }
 
-async function safeJson(res) {
-  try { return await res.json(); } catch { return {}; }
-}
+async function safeJson(res) { try { return await res.json(); } catch { return {}; } }
 
 exports.handler = async (event) => {
   try {
-    if (!ACCESS_TOKEN) return { statusCode: 500, headers: CORS, body: JSON.stringify({ error: 'Missing PROPTX_ACCESS_TOKEN' }) };
+    if (!ACCESS_TOKEN) {
+      return { statusCode: 500, headers: CORS, body: JSON.stringify({ error: 'Missing PROPTX_ACCESS_TOKEN' }) };
+    }
 
     const qp = event.queryStringParameters || {};
-    const place     = (qp.city || '').trim();     // now a place or city
+    const rawCity   = qp.city;               // may be undefined, '__all__', or a place/city string
     const status    = qp.status || 'Active';
     const minPrice  = qp.min_price ? Number(qp.min_price) : null;
     const maxPrice  = qp.max_price ? Number(qp.max_price) : null;
@@ -77,7 +74,7 @@ exports.handler = async (event) => {
     const sortBy    = qp.sort_by || 'date_desc';
     const openhouse = qp.openhouse === '1';
 
-    // Build property filter set
+    // --- Filters ---
     const filters = [];
     if (status)          filters.push(`StandardStatus eq ${q(status)}`);
     if (minPrice != null)filters.push(`ListPrice ge ${minPrice}`);
@@ -85,19 +82,32 @@ exports.handler = async (event) => {
     if (beds != null)    filters.push(`BedroomsTotal ge ${beds}`);
     if (baths != null)   filters.push(`BathroomsTotalInteger ge ${baths}`);
 
-    // Place matching (municipality OR region)
-    if (place) {
-      const { cities, regions } = resolvePlace(place);
-      const predicates = [];
-      if (cities.length)  predicates.push(orEq('City', cities));
+    // City defaulting:
+    // - if qp.city is undefined (frontend omitted when selecting the default), default to 'Kincardine'
+    // - if qp.city === '__all__', skip city filter (All Ontario)
+    // - else resolve the place/city normally
+    if (typeof rawCity === 'undefined') {
+      const { cities, regions } = resolvePlace('Kincardine');
+      const preds = [];
+      if (cities.length)  preds.push(orEq('City', cities));
       if (regions.length) {
-        // CityRegion eq '...' OR contains(CityRegion,'...') for partials
         const eqs = regions.map(r => `CityRegion eq ${q(r)}`);
         const partials = regions.map(r => `contains(CityRegion, ${q(r)})`);
-        predicates.push(`(${eqs.concat(partials).join(' or ')})`);
+        preds.push(`(${eqs.concat(partials).join(' or ')})`);
       }
-      filters.push(predicates.length > 1 ? `(${predicates.join(' or ')})` : predicates[0]);
+      if (preds.length) filters.push(preds.length > 1 ? `(${preds.join(' or ')})` : preds[0]);
+    } else if (rawCity !== '__all__' && rawCity.trim() !== '') {
+      const { cities, regions } = resolvePlace(rawCity);
+      const preds = [];
+      if (cities.length)  preds.push(orEq('City', cities));
+      if (regions.length) {
+        const eqs = regions.map(r => `CityRegion eq ${q(r)}`);
+        const partials = regions.map(r => `contains(CityRegion, ${q(r)})`);
+        preds.push(`(${eqs.concat(partials).join(' or ')})`);
+      }
+      if (preds.length) filters.push(preds.length > 1 ? `(${preds.join(' or ')})` : preds[0]);
     }
+    // else rawCity === '__all__' -> no city filter
 
     let orderby = 'ModificationTimestamp desc';
     if (sortBy === 'price_asc')  orderby = 'ListPrice asc';
@@ -119,12 +129,15 @@ exports.handler = async (event) => {
         'Latitude','Longitude','ModificationTimestamp'
       ].join(',');
 
-    // If "open houses", try strategies to get the relevant ListingKeys
+    // --- OPEN HOUSE + VIRTUAL TOUR key collection ---
     let restrictKeys = null;
     if (openhouse) {
+      const collected = new Set();
+
+      // Weekend window (Sat..Sun)
       const { startISO, endISO } = weekendWindowISO();
 
-      // Strategy 1: OpenHouse resource
+      // Strategy A: OpenHouse resource (try several field names)
       const ohPreds = [
         `StartTimestamp ge ${q(startISO)} and EndTimestamp le ${q(endISO)}`,
         `OpenHouseStartTimestamp ge ${q(startISO)} and OpenHouseEndTimestamp le ${q(endISO)}`,
@@ -138,45 +151,66 @@ exports.handler = async (event) => {
           if (!r.ok) continue;
           const j = await safeJson(r);
           const keys = Array.isArray(j.value) ? j.value.map(x => x && x.ResourceRecordKey).filter(Boolean) : [];
-          if (keys.length) { restrictKeys = Array.from(new Set(keys)); break; }
-        } catch { /* try next */ }
+          keys.forEach(k => collected.add(k));
+          if (keys.length) break; // first predicate that yields results is fine
+        } catch { /* keep trying */ }
       }
 
-      // Strategy 2: property-level flags (try independently; first that works wins)
-      if (!restrictKeys) {
-        // 2a) OpenHouseCount gt 0
-        try {
-          const u = `${BASE}/Property?$select=ListingKey&$filter=${encodeURIComponent('OpenHouseCount gt 0')}&$top=5000`;
-          const r = await fetch(u, { headers: AUTH_HEADERS });
-          if (r.ok) {
-            const j = await safeJson(r);
-            const keys = Array.isArray(j.value) ? j.value.map(x => x && x.ListingKey).filter(Boolean) : [];
-            if (keys.length) restrictKeys = Array.from(new Set(keys));
-          }
-        } catch { /* ignore */ }
-      }
-      if (!restrictKeys) {
-        // 2b) OpenHouseActiveYN eq true
-        try {
-          const u = `${BASE}/Property?$select=ListingKey&$filter=${encodeURIComponent('OpenHouseActiveYN eq true')}&$top=5000`;
-          const r = await fetch(u, { headers: AUTH_HEADERS });
-          if (r.ok) {
-            const j = await safeJson(r);
-            const keys = Array.isArray(j.value) ? j.value.map(x => x && x.ListingKey).filter(Boolean) : [];
-            if (keys.length) restrictKeys = Array.from(new Set(keys));
-          }
-        } catch { /* ignore */ }
-      }
+      // Strategy B: Property-level indicators
+      // B1) OpenHouseCount gt 0
+      try {
+        const u = `${BASE}/Property?$select=ListingKey&$filter=${encodeURIComponent('OpenHouseCount gt 0')}&$top=5000`;
+        const r = await fetch(u, { headers: AUTH_HEADERS });
+        if (r.ok) {
+          const j = await safeJson(r);
+          const keys = Array.isArray(j.value) ? j.value.map(x => x && x.ListingKey).filter(Boolean) : [];
+          keys.forEach(k => collected.add(k));
+        }
+      } catch {}
+      // B2) OpenHouseActiveYN eq true
+      try {
+        const u = `${BASE}/Property?$select=ListingKey&$filter=${encodeURIComponent('OpenHouseActiveYN eq true')}&$top=5000`;
+        const r = await fetch(u, { headers: AUTH_HEADERS });
+        if (r.ok) {
+          const j = await safeJson(r);
+          const keys = Array.isArray(j.value) ? j.value.map(x => x && x.ListingKey).filter(Boolean) : [];
+          keys.forEach(k => collected.add(k));
+        }
+      } catch {}
 
-      // If we still have no keys, return empty (there may simply be no OH this weekend)
+      // Strategy C: Virtual Tours via Media (VirtualTour, Video, or well-known hosts)
+      const vtPredicates = [
+        "(MediaCategory eq 'VirtualTour')",
+        "(MediaCategory eq 'Video')",
+        "contains(tolower(MediaURL),'youtube')",
+        "contains(tolower(MediaURL),'vimeo')",
+        "contains(tolower(MediaURL),'matterport')",
+        "contains(tolower(ShortDescription),'virtual')"
+      ];
+      const vtFilter = [
+        "ResourceName eq 'Property'",
+        `(${vtPredicates.join(' or ')})`
+      ].join(' and ');
+      try {
+        const u = `${BASE}/Media?$select=ResourceRecordKey&$filter=${encodeURIComponent(vtFilter)}&$top=5000`;
+        const r = await fetch(u, { headers: AUTH_HEADERS });
+        if (r.ok) {
+          const j = await safeJson(r);
+          const keys = Array.isArray(j.value) ? j.value.map(x => x && x.ResourceRecordKey).filter(Boolean) : [];
+          keys.forEach(k => collected.add(k));
+        }
+      } catch {}
+
+      restrictKeys = Array.from(collected);
       if (!restrictKeys || !restrictKeys.length) {
-        return { statusCode: 200, headers: CORS, body: JSON.stringify({ value: [], paging: { startidx, pgsize, openhouse:true } }) };
+        return { statusCode: 200, headers: CORS, body: JSON.stringify({ value: [], paging: { startidx, pgsize, openhouse: true } }) };
       }
     }
 
-    // 1) Properties (optionally intersect with open-house keys)
+    // --- 1) Fetch properties (optionally intersect with restrictKeys) ---
     let propUrl = `${BASE}/Property?${select}`;
     const propFilters = filters.slice();
+
     if (restrictKeys && restrictKeys.length) {
       const chunkSize = 40;
       const orGroups = [];
@@ -187,6 +221,7 @@ exports.handler = async (event) => {
       const keysPredicate = orGroups.length > 1 ? `(${orGroups.join(' or ')})` : orGroups[0];
       propFilters.push(keysPredicate);
     }
+
     if (propFilters.length) propUrl += `&$filter=${encodeURIComponent(propFilters.join(' and '))}`;
     propUrl += `&$orderby=${encodeURIComponent(orderby)}&$top=${pgsize}&$skip=${startidx}`;
 
@@ -195,13 +230,14 @@ exports.handler = async (event) => {
       const t = await propRes.text();
       return { statusCode: propRes.status, headers: CORS, body: JSON.stringify({ error: 'Property fetch failed', detail: t }) };
     }
+
     const propJson = await propRes.json();
     const listings = Array.isArray(propJson.value) ? propJson.value : [];
     if (!listings.length) {
       return { statusCode: 200, headers: CORS, body: JSON.stringify({ value: [], paging: { startidx, pgsize, openhouse: !!openhouse } }) };
     }
 
-    // 2) Photos (preferred first; fallback to any)
+    // --- 2) Join photos (Preferred first; fallback to any) ---
     const keys = listings.map(l => l.ListingKey).filter(Boolean);
     const photoMap = {}; // ListingKey -> { url, key }
 
@@ -216,6 +252,7 @@ exports.handler = async (event) => {
           orEq('ResourceRecordKey', chunk)
         ].filter(Boolean).join(' and ');
         const url = `${BASE}/Media?$filter=${encodeURIComponent(basePred)}&$top=2000`;
+
         const res = await fetch(url, { headers: AUTH_HEADERS });
         if (!res.ok) continue;
         const json = await safeJson(res);
@@ -243,3 +280,4 @@ exports.handler = async (event) => {
     return { statusCode: 500, headers: CORS, body: JSON.stringify({ error: 'Server error', detail: err.message }) };
   }
 };
+
